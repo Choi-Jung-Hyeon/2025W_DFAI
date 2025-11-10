@@ -44,4 +44,4 @@ submission.csv
 *.safetensors
 
 # 로컬 테스트용 노트북 무시
-task_local_cpu.ipynb
+# task_local_cpu.ipynb
