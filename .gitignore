@@ -17,7 +17,6 @@ __pycache__/
 Thumbs.db
 
 # (중요) 데이터셋
-# 팀원들이 수집한 수만 장의 이미지가 GitHub에 올라가면 안 됩니다.
 data/
 dataset/
 datasets/
@@ -29,8 +28,6 @@ real_degraded/
 fake_degraded/
 
 # (중요) 모델 가중치 및 로그
-# .pt, .pth, .safetensors는 LFS로 관리하지만
-# 로컬 학습 중 생성되는 체크포인트(checkpoints)는 무시합니다.
 logs/
 checkpoints/
 runs/
@@ -38,6 +35,10 @@ models_trained/
 *.log
 
 # (중요) 압축파일 및 제출물
-# aif.zip 같은 불필요한 파일 무시
 *.zip
 submission.csv
+
+# LFS로 관리할 대용량 파일 (선택 사항이지만 권장)
+*.pt
+*.pth
+*.safetensors
