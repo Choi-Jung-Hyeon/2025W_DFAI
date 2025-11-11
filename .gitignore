@@ -1,0 +1,47 @@
+# Python 가상환경
+venv/
+.venv/
+
+# Python 캐시
+__pycache__/
+*.pyc
+
+# Jupyter Notebook 체크포인트
+.ipynb_checkpoints/
+
+# VSCode 설정
+.vscode/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# (중요) 데이터셋
+data/
+dataset/
+datasets/
+real/
+fake/
+real_clean/
+fake_clean/
+real_degraded/
+fake_degraded/
+
+# (중요) 모델 가중치 및 로그
+logs/
+checkpoints/
+runs/
+models_trained/
+*.log
+
+# (중요) 압축파일 및 제출물
+*.zip
+submission.csv
+
+# LFS로 관리할 대용량 파일 (선택 사항이지만 권장)
+*.pt
+*.pth
+*.safetensors
+
+# 로컬 테스트용 노트북 무시
+# task_local_cpu.ipynb
