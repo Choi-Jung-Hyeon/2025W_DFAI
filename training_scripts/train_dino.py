@@ -1,4 +1,5 @@
 # 파일명: training_scripts/train_dino.py
+# (수정: 4채널 입력 및 실시간 훼손/디포커스 맵 생성 기능 추가)
 
 import torch
 import torch.nn as nn
@@ -7,33 +8,95 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from transformers import DinoV2ForImageClassification, AutoImageProcessor
 from PIL import Image
+import cv2
+import numpy as np
 from pathlib import Path
 import glob
 from tqdm import tqdm
-from sklearn.model_selection import train_test_split
-import os
+import random
+import io
 
 # --- 1. 하이퍼파라미터 및 경로 설정 ---
-# (DINOv2는 ViT보다 크므로 배치 크기를 작게 시작합니다)
 BATCH_SIZE = 16 
 LEARNING_RATE = 1e-5
-EPOCHS = 10 # (테스트용. 실제로는 30-50 Epoch 권장)
-MODEL_NAME = "facebook/dinov2-base" # DINOv2 백본
-SAVE_DIR = Path("../models_trained/dino_v1") # 학습된 모델 저장 폴더
+EPOCHS = 30 # 1위 탈환을 위해 Epoch 늘림
+MODEL_NAME = "facebook/dinov2-base"
+SAVE_DIR = Path("../models_trained/dino_v2_4channel") # 새 모델 경로
 
-# (중요!) STEP 2의 `build_degradation_dataset.py`가 생성할 데이터 폴더
 TRAIN_DIR = Path("../data/train")
 VAL_DIR = Path("../data/val")
-
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 훼손(Degradation) 파라미터
+JPEG_QUALITY_RANGE = (70, 90)
+BLUR_KERNEL_RANGE = (3, 7)
+GAUSSIAN_NOISE_STD_RANGE = (10, 30)
+
 print(f"Using device: {DEVICE}")
 
-# --- 2. 커스텀 데이터셋 정의 ---
-class DeepfakeDataset(Dataset):
-    def __init__(self, file_paths, labels, transform=None):
+# --- 2. 훼손 및 디포커스 맵 함수 ---
+
+def get_defocus_map(img_pil):
+    """
+    (핵심 2) 11주차 세미나의 디포커스 맵(Laplacian)을 계산합니다.
+    """
+    img_gray_cv = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2GRAY)
+    # 32-bit float로 라플라시안 계산 (경계선을 더 잘 잡기 위해)
+    laplacian = cv2.Laplacian(img_gray_cv, cv2.CV_32F, ksize=3)
+    # 0-255 범위로 정규화
+    defocus_map = cv2.normalize(np.abs(laplacian), None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    # 3차원 텐서로 만들기 위해 차원 추가 (H, W) -> (H, W, 1)
+    return Image.fromarray(defocus_map)
+
+def apply_degradation(img_pil):
+    """
+    (핵심 1) arXiv 논문의 훼손을 실시간으로 적용합니다.
+    """
+    choice = random.choice(['jpeg', 'reshoot', 'clean'])
+
+    if choice == 'jpeg':
+        # '인터넷 전송' 훼손
+        quality = random.randint(*JPEG_QUALITY_RANGE)
+        buffer = io.BytesIO()
+        img_pil.save(buffer, "JPEG", quality=quality)
+        buffer.seek(0)
+        return Image.open(buffer).convert("RGB")
+    
+    elif choice == 'reshoot':
+        # '재 디지털화' 훼손
+        img_cv = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+        kernel_size = random.randrange(*BLUR_KERNEL_RANGE, 2)
+        img_cv = cv2.GaussianBlur(img_cv, (kernel_size, kernel_size), 0)
+        std_dev = random.uniform(*GAUSSIAN_NOISE_STD_RANGE)
+        noise = np.random.normal(0, std_dev, img_cv.shape)
+        img_cv = np.clip(img_cv + noise, 0, 255).astype(np.uint8)
+        return Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+    
+    else:
+        # 'Clean' 원본
+        return img_pil
+
+# --- 3. 커스텀 데이터셋 (4채널) ---
+class DeepfakeDataset4Channel(Dataset):
+    def __init__(self, file_paths, labels, processor, apply_degradation_flag=False):
         self.file_paths = file_paths
         self.labels = labels
-        self.transform = transform
+        self.processor = processor # DINOv2 프로세서
+        self.apply_degradation = apply_degradation_flag
+
+        # DINOv2의 기본 변환 (정규화 제외)
+        self.resize_crop = transforms.Compose([
+            transforms.Resize(processor.size["shortest_edge"]),
+            transforms.CenterCrop(processor.size["shortest_edge"]),
+        ])
+        
+        # 훈련용 랜덤 뒤집기
+        self.random_flip = transforms.RandomHorizontalFlip()
+        
+        # 텐서 변환 및 정규화
+        self.to_tensor = transforms.ToTensor()
+        self.normalize_rgb = transforms.Normalize(mean=processor.image_mean, std=processor.image_std)
+        self.normalize_defocus = transforms.Normalize(mean=[0.5], std=[0.5]) # 1채널 정규화
 
     def __len__(self):
         return len(self.file_paths)
@@ -43,96 +106,125 @@ class DeepfakeDataset(Dataset):
         label = self.labels[idx]
         
         try:
-            # (중요) PIL로 열어야 DINOv2 프로세서와 호환됩니다.
-            image = Image.open(img_path).convert("RGB")
-            if self.transform:
-                image = self.transform(image)
-        except Exception as e:
-            # 깨진 이미지 로드 실패 시, 임의의 검은색 이미지 반환
-            print(f"Warning: Skipping broken image {img_path}: {e}")
-            image = torch.zeros((3, 224, 224)) # (C, H, W)
+            # 1. 원본(Clean) 로드
+            clean_image_pil = Image.open(img_path).convert("RGB")
             
-        return image, label
+            # 2. 디포커스 맵 계산 (Clean 이미지 기준)
+            defocus_map_pil = get_defocus_map(clean_image_pil)
 
-# --- 3. 데이터 로드 및 전처리 ---
+            # 3. (훈련 시에만) RGB 이미지 훼손 적용
+            if self.apply_degradation:
+                rgb_image_pil = apply_degradation(clean_image_pil)
+            else:
+                rgb_image_pil = clean_image_pil # 검증 시에는 원본 사용
+
+            # 4. 동기화 변환 (RGB와 Defocus Map을 동일하게 리사이즈/크롭)
+            rgb_image = self.resize_crop(rgb_image_pil)
+            defocus_map = self.resize_crop(defocus_map_pil)
+
+            # 5. (훈련 시에만) 동기화 뒤집기
+            if self.apply_degradation:
+                state = torch.get_rng_state() # 랜덤 상태 고정
+                rgb_image = self.random_flip(rgb_image)
+                torch.set_rng_state(state) # 동일한 상태로
+                defocus_map = self.random_flip(defocus_map)
+
+            # 6. 텐서로 변환 및 정규화
+            rgb_tensor = self.normalize_rgb(self.to_tensor(rgb_image))
+            defocus_tensor = self.normalize_defocus(self.to_tensor(defocus_map))
+            
+            # 7. (핵심) 4채널로 결합 [R, G, B, Defocus]
+            combined_tensor = torch.cat((rgb_tensor, defocus_tensor), dim=0)
+            
+        except Exception as e:
+            print(f"Warning: Skipping broken image {img_path}: {e}")
+            combined_tensor = torch.zeros((4, 224, 224)) # 4채널
+            label = 0 # 임의의 레이블
+            
+        return combined_tensor, label
+
+# --- 4. 데이터 로드 ---
 def load_data():
-    print("Loading data...")
-    # 0 = Real, 1 = Fake
+    processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
     
-    # STEP 2에서 이미 train/val로 분리된 데이터를 읽어옵니다.
-    train_files_real = glob.glob(str(TRAIN_DIR / "real" / "*.*[jpg|png|jpeg]"))
-    train_files_fake = glob.glob(str(TRAIN_DIR / "fake" / "*.*[jpg|png|jpeg]"))
-    val_files_real = glob.glob(str(VAL_DIR / "real" / "*.*[jpg|png|jpeg]"))
-    val_files_fake = glob.glob(str(VAL_DIR / "fake" / "*.*[jpg|png|jpeg]"))
-
-    train_files = train_files_real + train_files_fake
-    train_labels = [0] * len(train_files_real) + [1] * len(train_files_fake)
+    train_files = glob.glob(str(TRAIN_DIR / "real" / "*.*[jpg|png|jpeg]")) + \
+                  glob.glob(str(TRAIN_DIR / "fake" / "*.*[jpg|png|jpeg]"))
+    train_labels = [0] * len(glob.glob(str(TRAIN_DIR / "real" / "*.*[jpg|png|jpeg]"))) + \
+                   [1] * len(glob.glob(str(TRAIN_DIR / "fake" / "*.*[jpg|png|jpeg]")))
     
-    val_files = val_files_real + val_files_fake
-    val_labels = [0] * len(val_files_real) + [1] * len(val_files_fake)
+    val_files = glob.glob(str(VAL_DIR / "real" / "*.*[jpg|png|jpeg]")) + \
+                glob.glob(str(VAL_DIR / "fake" / "*.*[jpg|png|jpeg]"))
+    val_labels = [0] * len(glob.glob(str(VAL_DIR / "real" / "*.*[jpg|png|jpeg]"))) + \
+                 [1] * len(glob.glob(str(VAL_DIR / "fake" / "*.*[jpg|png|jpeg]")))
 
     if not train_files or not val_files:
         print("="*50)
-        print(f"오류: 훈련 또는 검증 데이터가 없습니다.")
-        print(f"팀원들이 'data/real_clean', 'data/fake_clean' 폴더를 채웠는지,")
-        print(f"`dataset_scripts/build_degradation_dataset.py`를 실행했는지 확인하세요.")
+        print("오류: 훈련 또는 검증 데이터가 없습니다.")
+        print("STEP 2 스크립트 (`build_dataset_folders.py`)를 먼저 실행했는지 확인하세요.")
         print("="*50)
         return None, None, None
 
-    print(f"Total Train images: {len(train_files)} (Real: {len(train_files_real)}, Fake: {len(train_files_fake)})")
-    print(f"Total Val images: {len(val_files)} (Real: {len(val_files_real)}, Fake: {len(val_files_fake)})")
+    train_dataset = DeepfakeDataset4Channel(train_files, train_labels, processor, apply_degradation_flag=True)
+    val_dataset = DeepfakeDataset4Channel(val_files, val_labels, processor, apply_degradation_flag=False)
 
-    # DINOv2에 맞는 전처리기(ImageProcessor) 로드
-    processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
-    
-    # 훈련용 변환 (Augmentation): 리사이즈, 정규화 + 랜덤 뒤집기
-    train_transform = transforms.Compose([
-        transforms.Resize(processor.size["shortest_edge"]),
-        transforms.CenterCrop(processor.size["shortest_edge"]),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=processor.image_mean, std=processor.image_std)
-    ])
-
-    # 검증용 변환: 리사이즈, 정규화
-    val_transform = transforms.Compose([
-        transforms.Resize(processor.size["shortest_edge"]),
-        transforms.CenterCrop(processor.size["shortest_edge"]),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=processor.image_mean, std=processor.image_std)
-    ])
-
-    train_dataset = DeepfakeDataset(train_files, train_labels, train_transform)
-    val_dataset = DeepfakeDataset(val_files, val_labels, val_transform)
-
-    # DataLoader 설정
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
+    print(f"Total Train images: {len(train_dataset)}")
+    print(f"Total Val images: {len(val_dataset)}")
+    
     return train_loader, val_loader, processor
 
-# --- 4. 모델 정의 ---
+# --- 5. 모델 정의 (4채널 입력) ---
 def build_model():
-    print(f"Loading pre-trained DINOv2 model: {MODEL_NAME}")
+    print(f"Loading pre-trained DINOv2 model: {MODEL_NAME} and modifying for 4-channel input")
     
-    # (중요!) 앙상블 금지 규칙을 준수하는 "단일 모델"입니다.
     model = DinoV2ForImageClassification.from_pretrained(
         MODEL_NAME,
-        num_labels=2, # (Real: 0, Fake: 1)
+        num_labels=2,
         id2label={0: "REAL", 1: "FAKE"},
         label2id={"REAL": 0, "FAKE": 1},
-        ignore_mismatched_sizes=True # (필수) 분류 헤드(classifier)를 2-label로 새로 초기화합니다.
+        ignore_mismatched_sizes=True 
     )
+
+    # (핵심) DINOv2의 첫 번째 레이어(Patch Embedding) 수정
+    # 원본: in_channels=3 (RGB)
+    orig_layer = model.dinov2.patch_embeddings.projection
+    
+    # 새 레이어: in_channels=4 (RGB + Defocus)
+    new_layer = nn.Conv2d(
+        in_channels=4, 
+        out_channels=orig_layer.out_channels, 
+        kernel_size=orig_layer.kernel_size, 
+        stride=orig_layer.stride, 
+        padding=orig_layer.padding, 
+        bias=(orig_layer.bias is not None)
+    )
+
+    # (중요!) 원본 3채널(RGB)의 가중치를 그대로 복사
+    with torch.no_grad():
+        new_layer.weight[:, :3, :, :] = orig_layer.weight.clone()
+        # 새 4번째 채널(Defocus) 가중치는 0으로 초기화 (또는 평균값)
+        new_layer.weight[:, 3, :, :].zero_() 
+        # (또는) new_layer.weight[:, 3, :, :] = orig_layer.weight.mean(dim=1) 
+        
+        if orig_layer.bias is not None:
+            new_layer.bias = nn.Parameter(orig_layer.bias.clone())
+
+    # DINOv2 모델의 첫 번째 레이어를 새 4채널 레이어로 교체
+    model.dinov2.patch_embeddings.projection = new_layer
+
+    print("Model modified for 4-channel (RGB + Defocus) input.")
     return model.to(DEVICE)
 
-# --- 5. 학습 및 검증 로직 ---
+# --- 6. 학습 및 검증 로직 ---
 def train_model(model, train_loader, val_loader, processor):
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss()
     best_val_acc = 0.0
     
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
-    best_model_path = SAVE_DIR / "best_model.pth"
+    best_model_path = SAVE_DIR / "best_model.pth" # (가중치만 저장)
 
     for epoch in range(EPOCHS):
         # --- 훈련 (Train) ---
@@ -177,25 +269,22 @@ def train_model(model, train_loader, val_loader, processor):
 
         print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {epoch_train_loss:.4f} | Val Loss: {epoch_val_loss:.4f} | Val Acc: {epoch_val_acc:.4f}")
 
-        # 최고 성능 모델 저장
         if epoch_val_acc > best_val_acc:
             best_val_acc = epoch_val_acc
             
-            # (중요!) 나중에 `task.ipynb`에서 불러올 수 있도록
-            # 가중치(state_dict)와 설정 파일(config, preprocessor)을 모두 저장합니다.
+            # (중요!) 제출에 필요한 3종 세트 저장
             torch.save(model.state_dict(), best_model_path)
             model.config.save_pretrained(SAVE_DIR)
             processor.save_pretrained(SAVE_DIR)
             
             print(f"New best model saved with Val Acc: {best_val_acc:.4f} to {SAVE_DIR}")
 
-    print(f"Training finished. Best model saved at {best_model_path} with Val Acc: {best_val_acc:.4f}")
+    print(f"Training finished. Best model saved at {SAVE_DIR} with Val Acc: {best_val_acc:.4f}")
 
-# --- 6. 메인 실행 ---
+# --- 7. 메인 실행 ---
 if __name__ == "__main__":
     train_loader, val_loader, processor = load_data()
     
-    # 데이터 로드에 성공한 경우에만 학습 시작
     if train_loader and val_loader:
         model = build_model()
         train_model(model, train_loader, val_loader, processor)
