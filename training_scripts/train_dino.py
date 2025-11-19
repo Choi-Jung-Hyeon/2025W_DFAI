@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from transformers import DinoV2ForImageClassification, AutoImageProcessor
+from transformers import Dinov2ForImageClassification, AutoImageProcessor
 from PIL import Image
 import cv2
 import numpy as np
@@ -18,15 +18,20 @@ import io
 import os
 
 # --- 1. 하이퍼파라미터 및 경로 설정 ---
-BATCH_SIZE = 16 
+BATCH_SIZE = 16
 LEARNING_RATE = 1e-5
 EPOCHS = 30 # (1위 탈환을 위해 30 epoch 이상 권장)
 MODEL_NAME = "facebook/dinov2-base"
-SAVE_DIR = Path("../models_trained/dino_v2_4channel") # 1위 모델 저장 폴더
+
+# 스크립트 파일의 위치를 기준으로 절대 경로 설정
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+
+SAVE_DIR = PROJECT_ROOT / "models_trained" / "dino_v2_4channel" # 1위 모델 저장 폴더
 
 # (공지사항 준수: 'train', 'val' 폴더명 사용 X)
-TRAIN_DIR = Path("../data/training_data")
-VAL_DIR = Path("../data/validation_data")
+TRAIN_DIR = PROJECT_ROOT / "data" / "training_data"
+VAL_DIR = PROJECT_ROOT / "data" / "validation_data"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -185,7 +190,7 @@ def load_data():
 def build_model():
     print(f"Loading pre-trained DINOv2 model: {MODEL_NAME} and modifying for 4-channel input")
     
-    model = DinoV2ForImageClassification.from_pretrained(
+    model = Dinov2ForImageClassification.from_pretrained(
         MODEL_NAME,
         num_labels=2,
         id2label={0: "REAL", 1: "FAKE"},
@@ -193,8 +198,12 @@ def build_model():
         ignore_mismatched_sizes=True # 2-label 분류 헤드로 새로 초기화
     )
 
+    # (중요!) Config에서도 채널 수를 4로 업데이트
+    model.config.num_channels = 4
+    model.dinov2.embeddings.patch_embeddings.num_channels = 4
+
     # (핵심) DINOv2의 첫 번째 레이어(Patch Embedding) 수정
-    orig_layer = model.dinov2.patch_embeddings.projection
+    orig_layer = model.dinov2.embeddings.patch_embeddings.projection
     
     new_layer = nn.Conv2d(
         in_channels=4, 
@@ -215,7 +224,7 @@ def build_model():
             new_layer.bias = nn.Parameter(orig_layer.bias.clone())
 
     # DINOv2 모델의 첫 번째 레이어를 새 4채널 레이어로 교체
-    model.dinov2.patch_embeddings.projection = new_layer
+    model.dinov2.embeddings.patch_embeddings.projection = new_layer
 
     print("Model modified for 4-channel (RGB + Defocus) input.")
     return model.to(DEVICE)
