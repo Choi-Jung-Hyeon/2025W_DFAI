@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from transformers import DinoV2ForImageClassification, AutoImageProcessor
+from transformers import Dinov2ForImageClassification, AutoImageProcessor
 from PIL import Image
 import cv2
 import numpy as np
@@ -185,7 +185,7 @@ def load_data():
 def build_model():
     print(f"Loading pre-trained DINOv2 model: {MODEL_NAME} and modifying for 4-channel input")
     
-    model = DinoV2ForImageClassification.from_pretrained(
+    model = Dinov2ForImageClassification.from_pretrained(
         MODEL_NAME,
         num_labels=2,
         id2label={0: "REAL", 1: "FAKE"},
